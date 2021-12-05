@@ -1077,8 +1077,10 @@ class Redis:
         pool = self.connection_pool
         command_name = args[0]
         conn = self.connection or await pool.get_connection(command_name, **options)
+        print("EXECUTE", args)
         try:
             resp = await conn.send_command(*args)
+            print("RESULT", type(resp), resp)
             return await self.parse_response(resp, command_name, **options)
         except ResponseError:
             if EMPTY_RESPONSE in options:
@@ -1099,8 +1101,7 @@ class Redis:
     ):
         """Parses a response from the Redis server"""
         if isinstance(response, ResponseError):
-            if EMPTY_RESPONSE in options:
-                return options[EMPTY_RESPONSE]
+            print("RESPONSE")
             raise response from None
 
         if command_name in self.response_callbacks:
@@ -3856,9 +3857,9 @@ class Monitor:
     async def __aenter__(self):
         await self.connect()
         self.connection = cast(Connection, self.connection)  # Connected above.
-        await self.connection.send_command("MONITOR")
+        response = await self.connection.send_command("MONITOR")
         # check that monitor returns 'OK', but don't return it to user
-        response = await self.connection.read_response()
+        #response = await self.connection.read_response()
         if not bool_ok(response):
             raise RedisError(f"MONITOR failed: {response}")
         return self
@@ -4489,15 +4490,36 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         all_cmds = connection.pack_commands(
             args for args, options in cmds if EMPTY_RESPONSE not in options
         )
-        await connection.send_packed_command(all_cmds)
+        raw_responses = await connection.send_packed_command(all_cmds, size=len(cmds))
         errors = []
+        responses = []
 
+        for resp in raw_responses[-1]:
+            print('resp', type(resp), resp)
+            resp = await self.parse_response(resp, "_")
+            responses.append(resp)
+
+        print(responses, commands)
+        # We have to run response callbacks manually
+        data = []
+        for r, cmd in zip(responses, commands):
+            if not isinstance(r, Exception):
+                args, options = cmd
+                command_name = args[0]
+                if command_name in self.response_callbacks:
+                    r = self.response_callbacks[command_name](r, **options)
+                    if inspect.isawaitable(r):
+                        r = await r
+            data.append(r)
+        return data
+
+        """
         # parse off the response for MULTI
         # NOTE: we need to handle ResponseErrors here and continue
         # so that we read all the additional command messages from
         # the socket
         try:
-            await self.parse_response(connection, "_")
+            resp = await self.parse_response(resp, "_")
         except ResponseError as err:
             errors.append((0, err))
 
@@ -4540,19 +4562,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         # find any errors in the response and raise if necessary
         if raise_on_error:
             self.raise_first_error(commands, response)
+        """
 
-        # We have to run response callbacks manually
-        data = []
-        for r, cmd in zip(response, commands):
-            if not isinstance(r, Exception):
-                args, options = cmd
-                command_name = args[0]
-                if command_name in self.response_callbacks:
-                    r = self.response_callbacks[command_name](r, **options)
-                    if inspect.isawaitable(r):
-                        r = await r
-            data.append(r)
-        return data
 
     async def _execute_pipeline(
         self, connection: Connection, commands: CommandStackT, raise_on_error: bool

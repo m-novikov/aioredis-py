@@ -20,6 +20,7 @@ from typing import (
     Mapping,
     Optional,
     Set,
+    NamedTuple,
     Tuple,
     Type,
     TypeVar,
@@ -152,6 +153,46 @@ class Encoder:
 
 
 ExceptionMappingT = Mapping[str, Union[Type[Exception], Mapping[str, Type[Exception]]]]
+
+class ParseError:
+    EXCEPTION_CLASSES: ExceptionMappingT = {
+        "ERR": {
+            "max number of clients reached": ConnectionError,
+            "Client sent AUTH, but no password is set": AuthenticationError,
+            "invalid password": AuthenticationError,
+            # some Redis server versions report invalid command syntax
+            # in lowercase
+            "wrong number of arguments for 'auth' command": AuthenticationWrongNumberOfArgsError,
+            # some Redis server versions report invalid command syntax
+            # in uppercase
+            "wrong number of arguments for 'AUTH' command": AuthenticationWrongNumberOfArgsError,
+            MODULE_LOAD_ERROR: ModuleError,
+            MODULE_EXPORTS_DATA_TYPES_ERROR: ModuleError,
+            NO_SUCH_MODULE_ERROR: ModuleError,
+            MODULE_UNLOAD_NOT_POSSIBLE_ERROR: ModuleError,
+        },
+        "EXECABORT": ExecAbortError,
+        "LOADING": BusyLoadingError,
+        "NOSCRIPT": NoScriptError,
+        "READONLY": ReadOnlyError,
+        "NOAUTH": AuthenticationError,
+        "NOPERM": NoPermissionError,
+    }
+
+    @classmethod
+    def parse_error(cls, response: str) -> ResponseError:
+        """Parse an error response"""
+        error_code = response.split(" ")[0]
+        if error_code in cls.EXCEPTION_CLASSES:
+            response = response[len(error_code) + 1 :]
+            exception_class_or_dict = cls.EXCEPTION_CLASSES[error_code]
+            if isinstance(exception_class_or_dict, dict):
+                exception_class = exception_class_or_dict.get(response, ResponseError)
+            else:
+                exception_class = exception_class_or_dict
+
+            return exception_class(response)
+        return ResponseError(response)
 
 
 class BaseParser:
@@ -559,21 +600,37 @@ class _State(enum.IntEnum):
     connected = enum.auto()
     error = enum.auto()
 
+class _Command(NamedTuple):
+    #: Command to send
+    cmd: bytes
+    #: Number of commands (responses to read)
+    size: int
 
 class RedisProtocol(asyncio.Protocol):
     """ """
 
-    def __init__(self):
+    def __init__(self, encoder: Encoder) -> None:
         self._state = _State.not_connected
         self._resp_queue = deque()
 
         self._transport: Optional[asyncio.Transport] = None
 
-        self._parser = hiredis.Reader()
+        parser_kwargs = {}
+        if encoder.decode_responses:
+            parser_kwargs = {
+                "encoding": encoder.encoding,
+                "errors": encoder.encoding_errors,
+            }
+        self._parser = hiredis.Reader(
+            protocolError=InvalidResponse,
+            replyError=ParseError.parse_error,
+            **parser_kwargs,
+        )
 
         self._responder_task = None
         self._exc = None
         self._conn_waiter = asyncio.get_event_loop().create_future()
+        self._encoder = encoder
 
     def connection_made(self, transport: asyncio.Transport) -> None:
         self._transport = transport
@@ -591,26 +648,41 @@ class RedisProtocol(asyncio.Protocol):
     async def wait_connected(self) -> None:
         await self._conn_waiter
 
-    def send_command(self, cmd):
-        fut = asyncio.get_event_loop().create_future()
+    def send_command(self, cmd: bytes, size: int = 1):
+        assert self._transport
+        if size == 1:
+            result = asyncio.get_event_loop().create_future()
+            futures = [result]
+        else:
+            assert size > 1
+
+            futures = []
+            for _ in range(size):
+                fut = asyncio.get_event_loop().create_future()
+                futures.append(fut)
+
+            result = asyncio.gather(*futures, return_exceptions=True)
+        print(size, cmd)
 
         if self._state == _State.connected:
             # It's possible that connection was dropped and connection_callback was not
             # called yet, to stop spamming errors, avoid writing to broken pipe
             # Both _UnixWritePipeTransport and _SelectorSocketTransport that we
             # expect to see here have this attribute
-            if not self._transport._conn_lost:
+            if not self._transport.is_closing():
                 self._transport.write(cmd)
-            self._resp_queue.append(fut)
+
+            for fut in futures:
+                self._resp_queue.append(fut)
 
         elif self._state == _State.not_connected:
-            fut.set_exception(Exception("Not connected"))
+            result.set_exception(Exception("Not connected"))
 
         elif self._state == _State.error:
             assert self._exc
-            fut.set_exception(self._exc)
+            result.set_exception(self._exc)
 
-        return fut
+        return result
 
     def data_received(self, data):
         if self._state != _State.connected:
@@ -628,6 +700,8 @@ class RedisProtocol(asyncio.Protocol):
                 self._set_exception(Exception("extra data"))
 
             else:
+                # if isinstance(res, bytes):
+                #     res = self._encoder.decode(res)
                 fut.set_result(res)
 
             res = self._parser.gets()
@@ -647,6 +721,12 @@ class RedisProtocol(asyncio.Protocol):
         while self._resp_queue:
             fut = self._resp_queue.popleft()
             fut.set_result(self._exc)
+
+    def disconnect(self):
+        assert self._transport
+        self._state = _State.not_connected
+        self._transport.close()
+        # TODO: Refine
 
     def can_read(self):
         return self._parser.has_data()
@@ -751,7 +831,7 @@ class Connection:
         self._connect_callbacks: List[ConnectCallbackT] = []
         self._buffer_cutoff = 6000
         self._lock = asyncio.Lock()
-        self._protocol = RedisProtocol()
+        self._protocol = RedisProtocol(self.encoder)
         self._conn = None
 
     def __repr__(self):
@@ -906,10 +986,7 @@ class Connection:
                     return
                 try:
                     if os.getpid() == self.pid:
-                        self._writer.close()  # type: ignore[union-attr]
-                        # py3.6 doesn't have this method
-                        if hasattr(self._writer, "wait_closed"):
-                            await self._writer.wait_closed()  # type: ignore[union-attr]
+                        self._protocol.disconnect()
                 except OSError:
                     pass
         except asyncio.TimeoutError:
@@ -924,26 +1001,27 @@ class Connection:
             and asyncio.get_event_loop().time() > self.next_health_check
         ):
             try:
-                await self.send_command("PING", check_health=False)
-                if str_if_bytes(await self.read_response()) != "PONG":
+                resp = await self.send_command("PING", check_health=False)
+                if str_if_bytes(resp) != "PONG":
                     raise ConnectionError("Bad response from PING health check")
             except (ConnectionError, TimeoutError) as err:
                 await self.disconnect()
                 try:
-                    await self.send_command("PING", check_health=False)
-                    if str_if_bytes(await self.read_response()) != "PONG":
+                    resp = await self.send_command("PING", check_health=False)
+                    if str_if_bytes(resp) != "PONG":
                         raise ConnectionError(
                             "Bad response from PING health check"
                         ) from None
                 except BaseException as err2:
                     raise err2 from err
 
-    def _send_packed_command(self, command: Iterable[bytes]):
-        return self._protocol.send_command(b"".join(command))
+    def _send_packed_command(self, command: Iterable[bytes], size: int):
+        return self._protocol.send_command(b"".join(command), size=size)
 
     async def send_packed_command(
         self,
         command: Union[bytes, str, Iterable[bytes]],
+        size: int = 1,
         check_health: bool = True,
     ):
         """Send an already packed command to the Redis server"""
@@ -957,10 +1035,19 @@ class Connection:
                 command = command.encode()
             if isinstance(command, bytes):
                 command = [command]
-            return await self._send_packed_command(command)
+            resp = await self._send_packed_command(command, size=size)
+
+            print("SEND PACKED COMMAND", type(resp), resp, isinstance(resp, ResponseError))
+            if isinstance(resp, RedisError):
+                raise resp from None
+
+            return resp
         except asyncio.TimeoutError:
             await self.disconnect()
             raise TimeoutError("Timeout writing to socket") from None
+        except RedisError as e:
+            await self.disconnect()
+            raise
         except OSError as e:
             await self.disconnect()
             if len(e.args) == 1:
@@ -1196,6 +1283,7 @@ class UnixDomainSocketConnection(Connection):  # lgtm [py/missing-call-to-init]
         self._parser = parser_class(socket_read_size=socket_read_size)
         self._connect_callbacks = []
         self._buffer_cutoff = 6000
+        self._protocol = RedisProtocol(self.encoder)
 
     def repr_pieces(self) -> Iterable[Tuple[str, Union[str, int]]]:
         pieces = [
@@ -1207,11 +1295,12 @@ class UnixDomainSocketConnection(Connection):  # lgtm [py/missing-call-to-init]
         return pieces
 
     async def _connect(self):
-        async with async_timeout.timeout(self.socket_connect_timeout):
-            reader, writer = await asyncio.open_unix_connection(path=self.path)
-        self._reader = reader
-        self._writer = writer
-        await self.on_connect()
+        await asyncio.get_event_loop().create_unix_connection(
+            lambda: self._protocol,
+            path=self.path,
+            ssl=self.ssl_context.get() if self.ssl_context else None,
+        )
+        await self._protocol.wait_connected()
 
     def _error_message(self, exception):
         # args for socket.error can either be (errno, "message")

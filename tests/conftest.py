@@ -178,7 +178,7 @@ async def r2(create_redis):
 
 def _gen_cluster_mock_resp(r, response):
     connection = mock.AsyncMock()
-    connection.read_response.return_value = response
+    connection.send_command.return_value = response
     r.connection = connection
     return r
 
